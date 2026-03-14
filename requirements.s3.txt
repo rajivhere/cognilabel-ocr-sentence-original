@@ -1,0 +1,4 @@
+# requirements.s3.txt
+boto3>=1.28,<2      # train code uses boto3; pin below v2 to avoid API surprises
+smart_open[s3]>=6.3 # optional, nice for streaming
+s3fs>=2023.1.0      # optional, only if you ever use fsspec-style s3:// reads

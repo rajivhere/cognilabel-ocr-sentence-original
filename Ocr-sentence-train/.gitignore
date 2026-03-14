@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# jupyter
+.ipynb_checkpoints
+
+# environment
+.env
+.env.*
+
+# training artifacts
+output/
+models/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

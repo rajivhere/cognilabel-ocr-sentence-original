@@ -1,0 +1,59 @@
+{
+  "status": "running",
+  "started_at": "2025-09-21T02:51:30Z",
+  "epoch": 31,
+  "last_metrics": {
+    "epoch": 31,
+    "loss": 226.68820190429688,
+    "CER": 0.9822801947593689,
+    "WER": 0.9994182586669922,
+    "val_loss": 304.37841796875,
+    "val_CER": 0.9823437333106995,
+    "val_WER": 0.9994203448295593,
+    "lr": 0.0010000000474974513
+  },
+  "best_so_far": {
+    "epoch": 31,
+    "loss": 226.68820190429688,
+    "CER": 0.9822801947593689,
+    "WER": 0.9994182586669922,
+    "val_loss": 304.37841796875,
+    "val_CER": 0.9823437333106995,
+    "val_WER": 0.9994203448295593,
+    "lr": 0.0010000000474974513
+  },
+  "updated_at": "2025-09-21T03:01:26Z",
+  "context": {
+    "width": 1048,
+    "height": 96,
+    "batch_size": 8,
+    "epochs_planned": 50,
+    "learning_rate_init": 0.001,
+    "dropout": 0.2,
+    "arch": "resnet_lstm",
+    "rtl_policy": "auto",
+    "blank_index": 56,
+    "vocab_size": 57,
+    "data_counts": {
+      "train": 40,
+      "val": 5,
+      "test": 5
+    },
+    "resume": {
+      "mode": "none",
+      "which": "best",
+      "resume_uri": "",
+      "resume_path": ""
+    }
+  },
+  "paths": {
+    "output_dir": "/outputs",
+    "checkpoint_best": "/outputs/checkpoints/best.keras",
+    "checkpoint_last": "/outputs/checkpoints/last.keras",
+    "train_csv": "/outputs/train.csv",
+    "final_model": "/outputs/model.keras",
+    "export_dir": "/outputs/export",
+    "vocab_json": "/outputs/vocab.json",
+    "configs_json": "/outputs/configs.json"
+  }
+}

@@ -487,7 +487,7 @@ def main():
     
     
     callbacks = [
-        CGLKerasLogger(),
+        CGLKerasLogger(monitor="val_CER", mode="min"),
         # 🔹 Full model – best
         ModelCheckpoint(
             ckpt_dir / "best.keras",

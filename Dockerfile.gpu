@@ -5,8 +5,15 @@ FROM ${PY_BASE}
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 \
     TF_CPP_MIN_LOG_LEVEL=1 PYTHONPATH=/app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+RUN rm -rf /var/lib/apt/lists/* \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     ca-certificates \
     git \
  && rm -rf /var/lib/apt/lists/*
@@ -43,6 +50,7 @@ COPY Ocr-sentence-train/configs.py               /app/Ocr-sentence-train/configs
 COPY Ocr-sentence-train/train_ocr_cglml_exec.py  /app/Ocr-sentence-train/train_ocr_cglml_exec.py
 COPY Ocr-sentence-train/last_state_writer.py     /app/Ocr-sentence-train/last_state_writer.py
 COPY Ocr-sentence-train/uploadUtil.py            /app/Ocr-sentence-train/uploadUtil.py
+
 
 WORKDIR /app/Ocr-sentence-train
 ENTRYPOINT ["python", "-u", "/app/Ocr-sentence-train/train_ocr_cglml_exec.py"]

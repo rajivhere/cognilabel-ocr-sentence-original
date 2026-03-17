@@ -32,6 +32,13 @@ from last_state_writer import LastStateWriter
 from cgl_data.resolver import resolve_split, resolve_resume_weights
 from cgl_data.outputs import OutputManager
 from uploadUtil import UploadBestOnImprove, UploadLastEveryEpoch
+from tensorflow.keras import mixed_precision
+from cgl_data.logging.keras.logger import CGLKerasLogger
+from cgl_data.logging.emitter import emit
+from cgl_data.logging.events import CGL_EVAL
+
+mixed_precision.set_global_policy("mixed_float16")
+
 
 
 # --------------------------------------------------
@@ -39,8 +46,12 @@ from uploadUtil import UploadBestOnImprove, UploadLastEveryEpoch
 # --------------------------------------------------
 def setup_tf():
     try:
-        for gpu in tf.config.list_physical_devices("GPU"):
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
+
+        tf.config.experimental.enable_tensor_float_32_execution(True)
+        tf.config.optimizer.set_jit(False)
     except Exception:
         pass
 
@@ -52,21 +63,45 @@ def build_vocab(samples):
     return sorted(chars)
 
 
-def load_jsonl(path, text_dir='ltr'):
+def load_jsonl(path, text_dir="ltr", max_reasonable_len=1000):
     items = []
     max_len = 0
+
+    def normalize_label(txt: str) -> str:
+        txt = txt.strip()
+        txt = " ".join(txt.split())
+        return txt
+
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             rec = json.loads(line)
+
             img = rec.get("file") or rec.get("image") or rec.get("path")
-            txt = rec.get("text") or rec.get("transcription")
-            if not img or not txt:
+            txt = rec.get("text") if rec.get("text") is not None else rec.get("transcription")
+
+            if not img or txt is None:
                 continue
-            is_rtl = (text_dir == "rtl") 
-            if is_rtl:
+
+            if not isinstance(txt, str):
+                print(f"[data] skipping non-string label at line {line_no}: {type(txt).__name__}")
+                continue
+
+            txt = normalize_label(txt)
+
+            if not txt:
+                print(f"[data] skipping empty/whitespace-only label at line {line_no}")
+                continue
+
+            if text_dir == "rtl":
                 txt = txt[::-1]
+
+            if len(txt) > max_reasonable_len:
+                print(f"[data] skipping suspiciously long label at line {line_no}: len={len(txt)} img={img}")
+                continue
+
             items.append((img, txt))
             max_len = max(max_len, len(txt))
+
     return items, max_len
 
 
@@ -303,17 +338,25 @@ def main():
     # OCR expects JSONL annotations
     train_items, train_max = load_jsonl(train_ref.local_annotations_path, text_dir or "ltr")
     val_items,   val_max   = load_jsonl(val_ref.local_annotations_path, text_dir or "ltr" )
-    test_items,  test_max  = (
-        load_jsonl(test_ref.local_annotations_path, text_dir or "ltr") if test_ref else ([], 0)
-    )
+   
     
     train_items = absolutize_items(train_items, train_ref.local_root)
     val_items   = absolutize_items(val_items,   val_ref.local_root)
-    test_items   = absolutize_items(test_items,   test_ref.local_root)
+    if test_ref:
+        test_items,  test_max  = load_jsonl(test_ref.local_annotations_path, text_dir or "ltr") if test_ref else ([], 0)
+        test_items = absolutize_items(test_items, test_ref.local_root)
+    else:
+        test_items = []
 
     vocab = build_vocab(train_items + val_items)
     blank_index = len(vocab)
     max_len = max(train_max, val_max, test_max)
+    
+    print(f"[dataset] train samples: {len(train_items)}")
+    print(f"[dataset] val samples: {len(val_items)}")
+    print(f"[dataset] test samples: {len(test_items)}")
+    print(f"[dataset] vocab size: {len(vocab)}")
+    print(f"[dataset] max label length: {max_len}")
 
     # --------------------------------------------------
     # 🔹 Data providers
@@ -372,11 +415,27 @@ def main():
     # Resume / finetune
     if resume_mode in ("resume", "finetune") and resume_path:
         print(f"[resume] mode={resume_mode}, which={resume_which}")
-        print(f"[weights] loading weights from {Path(resume_path).name}")
-        local_weights = resolve_resume_weights(resume_path, refs)
-        model.load_weights(local_weights, by_name=True)
-        print("[weights] initialized from checkpoint")
 
+        # ---------------------------------------------------
+        # Fix resume path
+        # ---------------------------------------------------
+        ckpt_file = "best.keras" if resume_which == "best" else "last.keras"
+
+        # Ensure no trailing slash
+        resume_path = resume_path.rstrip("/")
+
+        resume_uri = f"{resume_path}/{ckpt_file}"
+
+        print(f"[weights] loading weights from {resume_uri}")
+
+        # ---------------------------------------------------
+        # Resolve weights through cgl-data
+        # ---------------------------------------------------
+        local_weights = resolve_resume_weights(resume_uri, refs)
+
+        model.load_weights(local_weights)
+
+        print("[weights] initialized from checkpoint")
     # ---------------------------------------------------------
     # 4) Debug prints (UNCHANGED)
     # ---------------------------------------------------------
@@ -409,8 +468,11 @@ def main():
     # you already have 'vocab' as a Python list of chars
     vocab_for_metrics = "".join(vocab) + PAD   # <-- string + one extra char
 
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    optimizer = mixed_precision.LossScaleOptimizer(optimizer)
+    
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(lr),
+        optimizer=optimizer,
         loss=CTCloss(),
         metrics=[
             CERMetric(vocabulary=vocab_for_metrics),
@@ -425,13 +487,14 @@ def main():
     
     
     callbacks = [
+        CGLKerasLogger(),
         # 🔹 Full model – best
         ModelCheckpoint(
             ckpt_dir / "best.keras",
             monitor="val_CER",
             mode="min",
             save_best_only=True,
-            verbose=1,
+            verbose=0,
         ),
 
         # 🔹 Full model – last
@@ -448,7 +511,7 @@ def main():
             save_best_only=True,
             monitor="val_CER",
             mode="min",
-            verbose=1,
+            verbose=0,
         ),
 
         # 🔹 Weights only – last
@@ -465,7 +528,7 @@ def main():
             mode="min",
             patience=early_patience,
             restore_best_weights=True,
-            verbose=1,
+            verbose=0,
         ),
 
         # 🔹 LR schedule
@@ -476,7 +539,7 @@ def main():
             min_delta=0.002,
             min_lr=1e-6,
             mode="min",
-            verbose=1,
+            verbose=0,
         ),
         # ---- Upload policies via outputs.py ----
         UploadBestOnImprove(outputs, monitor="val_CER", mode="min"),
@@ -512,17 +575,29 @@ def main():
         validation_data=val_dp,
         epochs=epochs,
         callbacks=callbacks,
-        verbose=1,
+        verbose=0,
     )
     
     # ---------------- test evaluation ----------------
     test_metrics = None
     if test_dp:
-        print("Running test evaluation...")
-        results = model.evaluate(test_dp, verbose=1)
+        emit(CGL_EVAL, {
+            "phase": "begin",
+            "split": "test",
+            "samples": len(test_items),
+        })
+
+        results = model.evaluate(test_dp, verbose=0)
 
         # Keras returns list aligned with model.metrics_names
         test_metrics = dict(zip(model.metrics_names, map(float, results)))
+
+        emit(CGL_EVAL, {
+            "phase": "end",
+            "split": "test",
+            "samples": len(test_items),
+            "metrics": test_metrics,
+        })
 
 
     # ---------------- save artifacts ----------------

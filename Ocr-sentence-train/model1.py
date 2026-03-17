@@ -72,7 +72,7 @@ def train_model(input_dim, output_dim, activation="leaky_relu", dropout=0.2):
     blstm = layers.Bidirectional(layers.LSTM(128, return_sequences=True), name="bilstm_128")(blstm)
     blstm = layers.Dropout(dropout)(blstm)
 
-    output = layers.Dense(output_dim + 1, activation="softmax", name="output")(blstm)
+    output = layers.Dense(output_dim, activation="softmax", dtype="float32", name="output")(blstm)
 
     model = Model(inputs=inputs, outputs=output)
     return model

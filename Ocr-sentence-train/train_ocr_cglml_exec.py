@@ -33,7 +33,7 @@ from cgl_data.resolver import resolve_split, resolve_resume_weights
 from cgl_data.outputs import OutputManager
 from uploadUtil import UploadBestOnImprove, UploadLastEveryEpoch
 from tensorflow.keras import mixed_precision
-from cgl_data.logging.keras.logger import CGLKerasLogger
+from cgl_data.logging.keras.logger import CGLKerasLogger, CGLEarlyStopping
 from cgl_data.logging.emitter import emit
 from cgl_data.logging.events import CGL_EVAL
 
@@ -523,7 +523,7 @@ def main():
         ),
 
         # 🔹 Early stopping (env-driven)
-        EarlyStopping(
+        CGLEarlyStopping(
             monitor="val_CER",
             mode="min",
             patience=early_patience,

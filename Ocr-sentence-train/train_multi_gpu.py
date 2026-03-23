@@ -16,10 +16,7 @@ from pathlib import Path
 
 import signal
 
-def handle_sigterm(signum, frame):
-    print("[SPOT] interruption signal received - checkpointing...")
 
-signal.signal(signal.SIGTERM, handle_sigterm)
 
 import numpy as np
 import tensorflow as tf
@@ -46,6 +43,14 @@ from cgl_data.logging.keras.logger import CGLKerasLogger, CGLEarlyStopping
 from cgl_data.logging.emitter import emit
 from cgl_data.logging.events import CGL_EVAL
 
+
+def handle_sigterm(signum, frame):
+    print("[SPOT] interruption signal received - checkpointing...")
+    emit("CGL_SPOT_INTERRUPT", {
+        "timestamp": int(time.time())
+    })
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 # mixed_precision.set_global_policy("mixed_float16")
 
@@ -286,8 +291,9 @@ def main():
     tranformer_json = env("CGL_TRF_JSON", "", str)  # typo preserved intentionally
     spot_enabled = os.getenv("CGL_ENABLE_SPOT_RESUME", "false") == "true"
     spot_ckpt = Path("/opt/ml/checkpoints/ckpt.keras")
+    instance_type = os.getenv("CGL_INSTANCE_TYPE", "unknown")
     
-    print(f"[Spot] spot_training={spot_enabled}")
+    
 
     # --------------------------------------------------
     # 🔹 Setup
@@ -304,6 +310,12 @@ def main():
     print("[TF] physical GPUs:", tf.config.list_physical_devices("GPU"))
     print("[TF] logical GPUs:", tf.config.list_logical_devices("GPU"))
     print("[TF] num_replicas:", strategy.num_replicas_in_sync)
+    
+    emit("CGL_ENV", {
+        "spot_enabled": spot_enabled,
+        "instance_type": instance_type,
+        "num_gpus": num_gpus
+    })
         
     
     # per_gpu_batch_size = max(1, client_batch_size // max(1, num_gpus))

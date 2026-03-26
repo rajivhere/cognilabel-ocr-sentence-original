@@ -72,12 +72,20 @@ class LastStateWriter(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
         self.start_time = time.time()
         self._status = "running"
-        self._write({
+
+        prev = {}
+        try:
+            if self.path.exists():
+                prev = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            prev = {}
+
+        payload = {
             "status": self._status,
-            "started_at": _now_iso(),
-            "epoch": 0,
-            "last_metrics": {},
-            "best_so_far": None,
+            "started_at": prev.get("started_at") or _now_iso(),
+            "epoch": int(prev.get("epoch", 0)),
+            "last_metrics": prev.get("last_metrics", {}) or {},
+            "best_so_far": prev.get("best_so_far"),
             "context": {
                 "width": int(self.hyp.get("width", 0)),
                 "height": int(self.hyp.get("height", 0)),
@@ -103,7 +111,10 @@ class LastStateWriter(tf.keras.callbacks.Callback):
                 "configs_json": str(self.out / "configs.json"),
             },
             "updated_at": _now_iso(),
-        })
+        }
+
+        self.best = payload.get("best_so_far")
+        self._write(payload)
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}

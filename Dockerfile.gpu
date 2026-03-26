@@ -44,9 +44,9 @@ RUN pip install git+https://${GITHUB_TOKEN}@github.com/rajivhere/cgl-data.git@ma
 
 # ---- training entry files (only the ones we need) ----
 RUN mkdir -p /app/Ocr-sentence-train
-COPY Ocr-sentence-train/model1.py                 /app/Ocr-sentence-train/model1.py
-# COPY Ocr-sentence-train/model.py                 /app/Ocr-sentence-train/model.py
-COPY Ocr-sentence-train/configs.py               /app/Ocr-sentence-train/configs.py
+# COPY Ocr-sentence-train/model1.py                 /app/Ocr-sentence-train/model1.py
+COPY Ocr-sentence-train/model.py                 /app/Ocr-sentence-train/model.py
+# COPY Ocr-sentence-train/configs.py               /app/Ocr-sentence-train/configs.py
 # COPY Ocr-sentence-train/train_ocr_cglml_exec.py  /app/Ocr-sentence-train/train_ocr_cglml_exec.py
 COPY Ocr-sentence-train/train_multi_gpu.py  /app/Ocr-sentence-train/train_multi_gpu.py
 COPY Ocr-sentence-train/last_state_writer.py     /app/Ocr-sentence-train/last_state_writer.py

@@ -1,5 +1,7 @@
 import tensorflow as tf
 from cgl_data.outputs import OutputManager
+from pathlib import Path
+
 
 
 class UploadBestOnImprove(tf.keras.callbacks.Callback):
@@ -30,9 +32,10 @@ class UploadBestOnImprove(tf.keras.callbacks.Callback):
 
         refs = self.outputs.refs()
         # upload weights
-        self.outputs.upload_checkpoint(refs.checkpoints_dir / "best.weights.h5", "best.weights.h5")
+        self.outputs.upload_checkpoint(refs.models_dir / "best.weights.h5", "best.weights.h5")
         # upload full model if produced
-        self.outputs.upload_checkpoint(refs.checkpoints_dir / "best.keras", "best.keras")
+        self.outputs.upload_checkpoint(refs.models_dir / "best.keras", "best.keras")        
+       
 
 
 class UploadLastEveryEpoch(tf.keras.callbacks.Callback):
@@ -46,5 +49,6 @@ class UploadLastEveryEpoch(tf.keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         refs = self.outputs.refs()
-        self.outputs.upload_checkpoint(refs.checkpoints_dir / "last.weights.h5", "last.weights.h5")
-        self.outputs.upload_checkpoint(refs.checkpoints_dir / "last.keras", "last.keras")
+        self.outputs.upload_checkpoint(refs.models_dir / "last.weights.h5", "last.weights.h5")
+        self.outputs.upload_checkpoint(refs.models_dir / "last.keras", "last.keras")
+        self.outputs.upload_checkpoint(Path("/opt/ml/checkpoints/last_state.json"), "last_state.json")

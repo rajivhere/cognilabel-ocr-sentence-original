@@ -31,7 +31,7 @@ from mltu.tensorflow.losses import CTCloss
 from mltu.tensorflow.metrics import CERMetric, WERMetric
 from mltu.annotations.images import CVImage
 
-from model1 import train_model
+from model import train_model
 from last_state_writer import LastStateWriter
 
 # ✅ NEW: Cognilabel data + outputs
@@ -443,7 +443,10 @@ def main():
 
     vocab = build_vocab(train_items + val_items)
     blank_index = len(vocab)
-    max_len = max(train_max, val_max, test_max)
+    if(test_max):
+        max_len = max(train_max, val_max, test_max)
+    else:
+        max_len = max(train_max, val_max)
     
     print(f"[dataset] train samples: {len(train_items)}")
     print(f"[dataset] val samples: {len(val_items)}")
@@ -465,6 +468,12 @@ def main():
             LabelPadding(max_word_length=max_len, padding_value=blank_index),
         ],
     )
+    
+    train_dp.augmentors = [
+    RandomBrightness(), 
+    RandomErodeDilate(),
+    RandomSharpen(),
+    ]
 
     val_dp = DataProvider(
         dataset=val_items,
@@ -499,35 +508,35 @@ def main():
     print(f"[Model] Input w={width}, h={height}")
 
     with strategy.scope():
-        model = None
-        loaded_from_spot = False
-
-        if spot_enabled and spot_ckpt.exists():
-            print("🔥 Spot resume detected")
-            model = tf.keras.models.load_model(
-                spot_ckpt,
-                custom_objects={
-                    "CTCloss": CTCloss,
-                    "CERMetric": CERMetric,
-                    "WERMetric": WERMetric,
-                },
-                compile=True,
-            )
-            loaded_from_spot = True
-
-        else:
-            model = train_model(
+        model = train_model(
                 input_dim=(height, width, 3),
-                output_dim=len(vocab) + 1,
+                output_dim=len(vocab),
                 dropout=dropout,
                 activation=activation,
             )
+        loaded_from_spot = False
+        effective_lr = lr
+
+        if spot_enabled and spot_ckpt.exists():
+            print("🔥 Spot resume detected")
+                        
+            local_weights = resolve_resume_weights(spot_ckpt, refs)
+            model.load_weights(local_weights)            
+            loaded_from_spot = True
+            try:
+                st = json.loads(last_state_path.read_text(encoding="utf-8"))
+                effective_lr = float(st.get("last_metrics", {}).get("lr", 0.0))
+                print(f"[resume] Resuming from learning rate {effective_lr}")
+            except Exception as e:
+                print(f"[resume] Failed to read last_state.json: {e}")
+
+        else:           
             
             # Resume / finetune
             if resume_mode in ("resume", "finetune") and resume_path:
                 print(f"[resume] mode={resume_mode}, which={resume_which}")
 
-                ckpt_file = "best.keras" if resume_which == "best" else "last.keras"
+                ckpt_file = "best.weights.h5" if resume_which == "best" else "last.weights.h5"
                 resume_path = resume_path.rstrip("/")
                 resume_uri = f"{resume_path}/{ckpt_file}"
 
@@ -560,37 +569,22 @@ def main():
         # Conservative LR scaling:
         # scale from the original single-GPU baseline in proportion to effective global batch
         # For resume / finetune, do NOT scale LR yet.
-        # CTC training is numerically sensitive, especially after restoring weights.
-        if not loaded_from_spot:
-            if resume_mode in ("resume", "finetune"):
-                scaled_lr = lr
-                lr_reason = "resume_no_scale"
-            else:
-                base_reference_batch = max(1, client_batch_size)
-                scaled_lr = lr * (effective_global_batch_size / base_reference_batch)
-                lr_reason = "fresh_scaled"
+        # CTC training is numerically sensitive, especially after restoring weights.  
+        
+                        
+          
+        optimizer=tf.keras.optimizers.Adam(learning_rate=effective_lr)
 
-            print(
-                f"[opt] lr base={lr}, effective_lr={scaled_lr}, "
-                f"client_batch={client_batch_size}, effective_global_batch={effective_global_batch_size}, "
-                f"lr_mode={lr_reason}"
-            )
-
-            optimizer = tf.keras.optimizers.Adam(
-                learning_rate=scaled_lr,
-                clipvalue=1.0
-            )
-
-            model.compile(
-                optimizer=optimizer,
-                loss=CTCloss(),
-                metrics=[
-                    CERMetric(vocabulary=vocab_for_metrics),
-                    WERMetric(vocabulary=vocab_for_metrics),
-                ],
-            )
-        else:
-            print("[opt] using optimizer state restored from spot checkpoint")
+        model.compile(
+            optimizer=optimizer,
+            loss=CTCloss(),
+            metrics=[
+                CERMetric(vocabulary=vocab),
+                WERMetric(vocabulary=vocab),
+            ],
+        )
+        # else:
+        #     print("[opt] using optimizer state restored from spot checkpoint")
         
        
 
@@ -657,12 +651,12 @@ def main():
         # 🔹 LR schedule
         ReduceLROnPlateau(
             monitor="val_CER",
-            factor=0.5,
-            patience=6,
-            min_delta=0.002,
-            min_lr=1e-6,
+            factor=0.9,
+            patience=10,
+            min_delta=1e-10,           
+            cooldown=2,
             mode="min",
-            verbose=0,
+            verbose=1,
         ),
         # ---- Upload policies via outputs.py ----
         UploadBestOnImprove(outputs, monitor="val_CER", mode="min"),
@@ -672,14 +666,14 @@ def main():
 
     callbacks.append(
         LastStateWriter(
-            out_dir=str(refs.local_root),
+            out_dir=str("/opt/ml/checkpoints"),
             hyp={
                 "epochs": epochs,
                 "client_batch_size": client_batch_size,
                 "per_gpu_batch_size": per_gpu_batch_size,
                 "effective_global_batch_size": effective_global_batch_size,
                 "num_gpus": num_gpus,
-                "lr": scaled_lr,
+                "lr": effective_lr,
                 "base_lr": lr,
                 "width": width,
                 "height": height,
@@ -695,12 +689,26 @@ def main():
             resume={},
         )
     )
+    
+    checkpoint_dir = Path("/opt/ml/checkpoints")
+    last_state_path = checkpoint_dir / "last_state.json"
+
+    initial_epoch = 0
+
+    if last_state_path.exists():
+        try:
+            st = json.loads(last_state_path.read_text(encoding="utf-8"))
+            initial_epoch = int(st.get("epoch", 0))
+            print(f"[resume] Resuming from epoch {initial_epoch}")
+        except Exception as e:
+            print(f"[resume] Failed to read last_state.json: {e}")
 
     # ---------------- training ----------------
     model.fit(
         train_dp,
         validation_data=val_dp,
         epochs=epochs,
+        initial_epoch=initial_epoch,
         callbacks=callbacks,
         verbose=0,
         # workers=4,
@@ -755,7 +763,7 @@ def main():
         "training": {
             "epochs_requested": epochs,
             "base_learning_rate": lr,
-            "effective_learning_rate": scaled_lr,
+            "effective_learning_rate": effective_lr,
             "client_batch_size": client_batch_size,
             "per_gpu_batch_size": per_gpu_batch_size,
             "effective_global_batch_size": effective_global_batch_size,
@@ -773,7 +781,7 @@ def main():
         metrics_payload["test_samples"] = len(test_items)
         metrics_payload["test_metrics"] = test_metrics
         
-    last_state_path = Path(refs.local_root) / "last_state.json"
+    # last_state_path = Path("/opt/ml/checkpoints/last_state.json")
 
     if last_state_path.exists():
         st = json.loads(last_state_path.read_text(encoding="utf-8"))

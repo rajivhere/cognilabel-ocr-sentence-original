@@ -51,6 +51,8 @@ COPY Ocr-sentence-train/model.py                 /app/Ocr-sentence-train/model.p
 COPY Ocr-sentence-train/train_multi_gpu.py  /app/Ocr-sentence-train/train_multi_gpu.py
 COPY Ocr-sentence-train/last_state_writer.py     /app/Ocr-sentence-train/last_state_writer.py
 COPY Ocr-sentence-train/uploadUtil.py            /app/Ocr-sentence-train/uploadUtil.py
+COPY Ocr-sentence-train/preprocessors.py           /app/Ocr-sentence-train/preprocessors.py
+COPY Ocr-sentence-train/val_diagnostics.py           /app/Ocr-sentence-train/val_diagnostics.py
 
 
 WORKDIR /app/Ocr-sentence-train

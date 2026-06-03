@@ -28,9 +28,12 @@ from mltu.preprocessors import ImageReader
 from mltu.transformers import ImageResizer, LabelIndexer, LabelPadding
 from mltu.augmentors import RandomBrightness, RandomRotate, RandomErodeDilate, RandomSharpen
 from mltu.tensorflow.dataProvider import DataProvider
-from mltu.tensorflow.losses import CTCloss
+# from mltu.tensorflow.losses import CTCloss
 from mltu.tensorflow.metrics import CERMetric, WERMetric
+from metrics import SafeCERMetric, SafeWERMetric
 from mltu.annotations.images import CVImage
+
+from loss import CTCloss
 
 from model import train_model
 from last_state_writer import LastStateWriter
@@ -115,36 +118,67 @@ def build_vocab(samples):
         chars.update(txt)
     return sorted(chars)
 
-# BOUNDARY_NEUTRALS_RE = re.compile(
-#     r"""([\s\.\,\،\؛\:\!\؟\?\…\"\'\)\]\}\»\”\“\%]+)$"""
-# )
-BOUNDARY_NEUTRALS_RE = re.compile(
-    r"""([\s\.\,\،\؛\:\!\؟\?\…]+)$"""
-)
 
-def rtl_boundary_neutrals(txt: str) -> str:
+
+SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,،؛:!؟?\…])")
+
+def normalize_ocr_label(txt: str) -> str:
     """
-    For RTL OCR line labels, move only a trailing neutral run to the front.
+    Keep OCR labels in logical Unicode order.
 
-    Example:
-      'الآخر واحترام الذات .' -> '. الآخر واحترام الذات'
+    This must NOT convert Arabic labels to visual order.
+    This must NOT move trailing punctuation to the front.
+    This must NOT reverse text.
 
-    This does NOT reverse Arabic text.
-    This does NOT move punctuation in the middle of the sentence.
+    Safe cleanup only:
+    - trim
+    - collapse whitespace
+    - remove space before punctuation
     """
+    txt = txt or ""
     txt = " ".join(txt.strip().split())
+    txt = SPACE_BEFORE_PUNCT_RE.sub(r"\1", txt)
+    return txt
 
-    m = BOUNDARY_NEUTRALS_RE.search(txt)
-    if not m:
-        return txt
+def env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
 
-    tail = m.group(1).strip()
-    body = txt[:m.start()].rstrip()
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
-    if not tail or not body:
-        return txt
 
-    return f"{tail} {body}"
+def apply_output_time_axis_policy(model, reverse_time_axis: bool):
+    """
+    For CRNN/CTC OCR.
+
+    Normal model output shape:
+    [batch, time_steps, vocab + blank]
+
+    For RTL logical labels, CTC needs model time order to match:
+    label[0] -> label[-1]
+
+    Arabic image x-axis is usually:
+    sentence end -> sentence start when scanned left-to-right
+
+    So for RTL we reverse the model output time axis once here.
+
+    By wrapping the model output, loss, CER/WER metrics, diagnostics,
+    saved final.keras, and inference all see the same corrected order.
+    """
+    if not reverse_time_axis:
+        return model
+
+    y = tf.keras.layers.Lambda(
+        lambda t: tf.reverse(t, axis=[1]),
+        name="rtl_reverse_time_axis",
+    )(model.output)
+
+    return tf.keras.Model(
+        inputs=model.input,
+        outputs=y,
+        name=f"{model.name}_rtl_time_corrected",
+    )
 
 
 def load_jsonl(path, text_dir="ltr", max_reasonable_len=1000):
@@ -153,11 +187,7 @@ def load_jsonl(path, text_dir="ltr", max_reasonable_len=1000):
     debug_label_examples = 0
     
     def normalize_label(txt: str) -> str:
-        txt = txt.strip()
-        txt = " ".join(txt.split())
-        if text_dir == "rtl":
-            txt = rtl_boundary_neutrals(txt)
-        return txt
+        return normalize_ocr_label(txt)
 
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -175,13 +205,14 @@ def load_jsonl(path, text_dir="ltr", max_reasonable_len=1000):
 
             txt = normalize_label(txt)
             
-            # Optional: show only first few RTL label transformations
             if text_dir == "rtl" and debug_label_examples < 5:
-                raw_txt = rec.get("text") if rec.get("text") is not None else rec.get("transcription")
-                raw_norm = " ".join(str(raw_txt).strip().split())
-                if raw_norm != txt:
-                    print(f"[label][rtl_boundary_neutrals] {repr(raw_norm)} -> {repr(txt)}")
-                    debug_label_examples += 1
+                print(
+                    "[label][logical]",
+                    "first=", repr(txt[0] if txt else ""),
+                    "last=", repr(txt[-1] if txt else ""),
+                    "label=", repr(txt),
+                )
+                debug_label_examples += 1
 
             if not txt:
                 print(f"[data] skipping empty/whitespace-only label at line {line_no}")
@@ -471,6 +502,27 @@ def build_pipeline_from_env(aug_json, trf_json, vocab, max_label_len, H, W):
 
     return pre, aug, trf
 
+
+def get_image_padding_color_from_preprocess_ops(preprocess_ops):
+    """
+    Choose ImageResizer padding color to match deterministic polarity normalization.
+    Default: black, to preserve existing behavior if no polarity op is present.
+    """
+    for op in preprocess_ops or []:
+        if not isinstance(op, dict):
+            continue
+        if op.get("key") == "NormalizePolarity":
+            cfg = op.get("config") or {}
+            target = cfg.get("target", "dark_on_light")
+
+            if target == "dark_on_light":
+                return (255, 255, 255)
+
+            if target == "light_on_dark":
+                return (0, 0, 0)
+
+    return (0, 0, 0)
+
 def env(name, default=None, cast=str):
     val = os.getenv(name, default)
     if val is None:
@@ -479,6 +531,319 @@ def env(name, default=None, cast=str):
         return cast(val)
     except Exception:
         raise ValueError(f"Invalid value for {name}: {val}")
+
+def _as_tensor_spec(value, name="tensor"):
+    """
+    Build a TensorSpec from the actual DataProvider output.
+    Keeps this compatible with TF 2.18 / Keras 3 without changing mltu.DataProvider.
+    """
+    arr = np.asarray(value)
+    if arr.dtype == np.dtype("O"):
+        raise RuntimeError(
+            f"{name} has object dtype. DataProvider must return dense numeric arrays, "
+            "not ragged/object arrays, for MirroredStrategy."
+        )
+    return tf.TensorSpec(shape=arr.shape, dtype=tf.as_dtype(arr.dtype))
+
+
+def repeat_provider(dp, steps, name="train"):
+    """
+    Infinite epoch-safe wrapper around mltu.DataProvider.
+
+    This avoids Keras 3 / MirroredStrategy exhausting the PyDataset-style provider
+    after the first epoch, while keeping the original DataProvider pipeline intact.
+    """
+    epoch = 0
+
+    while True:
+        for i in range(steps):
+            batch = dp[i]
+
+            if not isinstance(batch, (tuple, list)) or len(batch) != 2:
+                raise RuntimeError(
+                    f"[repeat_provider][{name}] Expected (x, y) from provider, "
+                    f"got {type(batch)}"
+                )
+
+            x, y = batch
+
+            # Convert once here so tf.data sees stable dense arrays.
+            x = np.asarray(x)
+            y = np.asarray(y)
+
+            if x.shape[0] <= 0:
+                raise RuntimeError(f"[repeat_provider][{name}] Empty x batch at index={i}")
+
+            if y.shape[0] <= 0:
+                raise RuntimeError(f"[repeat_provider][{name}] Empty y batch at index={i}")
+
+            yield x, y
+
+        epoch += 1
+
+        # Preserve mltu shuffle/epoch behavior if present.
+        if hasattr(dp, "on_epoch_end"):
+            try:
+                dp.on_epoch_end()
+            except Exception as e:
+                print(f"[repeat_provider][{name}] on_epoch_end failed: {e}")
+
+
+def make_repeating_tf_dataset(dp, steps, name="train"):
+    """
+    Convert the existing mltu DataProvider into a repeatable tf.data.Dataset.
+    Does not replace your preprocessing/augmentation/transformer logic.
+    """
+    sample_x, sample_y = dp[0]
+
+    sample_x = np.asarray(sample_x)
+    sample_y = np.asarray(sample_y)
+
+    print(f"[tfdata][{name}] sample_x.shape={sample_x.shape} dtype={sample_x.dtype}")
+    print(f"[tfdata][{name}] sample_y.shape={sample_y.shape} dtype={sample_y.dtype}")
+
+    if sample_x.shape[0] <= 0 or sample_y.shape[0] <= 0:
+        raise RuntimeError(f"[tfdata][{name}] Provider returned an empty first batch")
+
+    output_signature = (
+        _as_tensor_spec(sample_x, f"{name}.x"),
+        _as_tensor_spec(sample_y, f"{name}.y"),
+    )
+
+    ds = tf.data.Dataset.from_generator(
+        lambda: repeat_provider(dp, steps, name),
+        output_signature=output_signature,
+    )
+
+    # Important: let MirroredStrategy shard by batch, not by file.
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+
+    return ds.with_options(options).prefetch(tf.data.AUTOTUNE)
+
+
+def decode_batch_greedy_np(y_pred, vocab, blank_index):
+    """
+    Simple greedy CTC-style decode for diagnostics.
+    Assumes y_pred is already probabilities from softmax:
+    [batch, time, vocab + blank]
+    """
+    idxs = np.argmax(y_pred, axis=-1)
+
+    texts = []
+    for row in idxs:
+        prev = None
+        chars = []
+
+        for k in row:
+            k = int(k)
+
+            # CTC collapse repeats, remove blank
+            if k != blank_index and k != prev:
+                if 0 <= k < len(vocab):
+                    chars.append(vocab[k])
+
+            prev = k
+
+        texts.append("".join(chars))
+
+    return texts
+
+
+def label_row_to_text(y_row, vocab, blank_index):
+    chars = []
+    for k in np.asarray(y_row).tolist():
+        k = int(k)
+        if 0 <= k < len(vocab) and k != blank_index:
+            chars.append(vocab[k])
+    return "".join(chars)
+
+
+def simple_cer(ref, hyp):
+    """
+    Tiny dependency-free CER for diagnostics only.
+    """
+    ref = ref or ""
+    hyp = hyp or ""
+
+    n, m = len(ref), len(hyp)
+    if n == 0:
+        return 0.0 if m == 0 else 1.0
+
+    prev = list(range(m + 1))
+    for i in range(1, n + 1):
+        cur = [i] + [0] * m
+        for j in range(1, m + 1):
+            cost = 0 if ref[i - 1] == hyp[j - 1] else 1
+            cur[j] = min(
+                prev[j] + 1,
+                cur[j - 1] + 1,
+                prev[j - 1] + cost,
+            )
+        prev = cur
+
+    return prev[m] / max(1, n)
+
+
+def inspect_model_direction(model, text_dir, reverse_time_axis):
+    """
+    Confirms whether the model architecture contains the RTL reversal layer.
+    """
+    layer_names = [layer.name for layer in model.layers]
+    has_rtl_layer = "rtl_reverse_time_axis" in layer_names
+
+    print("[direction-check] text_dir=", text_dir)
+    print("[direction-check] reverse_time_axis=", reverse_time_axis)
+    print("[direction-check] has_rtl_reverse_time_axis_layer=", has_rtl_layer)
+
+    if reverse_time_axis and not has_rtl_layer:
+        print(
+            "[direction-check][WARNING] reverse_time_axis=True but "
+            "rtl_reverse_time_axis layer was not found in model."
+        )
+
+    if not reverse_time_axis and has_rtl_layer:
+        print(
+            "[direction-check][WARNING] reverse_time_axis=False but "
+            "rtl_reverse_time_axis layer exists in model."
+        )
+
+    # Print the last few layers so you can verify final order in logs
+    print("[direction-check] last layers:")
+    for layer in model.layers[-8:]:
+        print(f"  - {layer.name}: {layer.__class__.__name__}")
+
+
+def run_rtl_direction_batch_diagnostic(
+    model,
+    data_provider,
+    vocab,
+    blank_index,
+    text_dir,
+    reverse_time_axis,
+    name="train",
+    max_samples=3,
+):
+    """
+    Shows whether decoded output is being read in the intended direction.
+
+    For RTL fixed model:
+    - normal decode should be the corrected/logical direction
+    - manually reversed decode is shown only as a contrast
+    """
+    try:
+        x_batch, y_batch = data_provider[0]
+        x_batch = np.asarray(x_batch)
+        y_batch = np.asarray(y_batch)
+
+        y_pred = model.predict(x_batch, verbose=0)
+
+        # Normal model output decode
+        pred_normal = decode_batch_greedy_np(y_pred, vocab, blank_index)
+
+        # Diagnostic-only opposite direction decode
+        pred_opposite = decode_batch_greedy_np(y_pred[:, ::-1, :], vocab, blank_index)
+
+        print(
+            f"[rtl-diag][{name}] text_dir={text_dir} "
+            f"reverse_time_axis={reverse_time_axis} "
+            f"x_shape={x_batch.shape} y_shape={y_batch.shape} "
+            f"y_pred_shape={y_pred.shape}"
+        )
+
+        for i in range(min(max_samples, x_batch.shape[0])):
+            ref = label_row_to_text(y_batch[i], vocab, blank_index)
+            normal = pred_normal[i]
+            opposite = pred_opposite[i]
+
+            cer_normal = simple_cer(ref, normal)
+            cer_opposite = simple_cer(ref, opposite)
+
+            print(f"[rtl-diag][{name}][sample {i}]")
+            print(f"  REF first/last: {repr(ref[:1])} / {repr(ref[-1:] if ref else '')}")
+            print(f"  REF: {repr(ref)}")
+            print(f"  NORMAL_DECODE first/last: {repr(normal[:1])} / {repr(normal[-1:] if normal else '')}")
+            print(f"  NORMAL_DECODE: {repr(normal)}")
+            print(f"  NORMAL_CER: {cer_normal:.4f}")
+            print(f"  OPPOSITE_TIME_DECODE first/last: {repr(opposite[:1])} / {repr(opposite[-1:] if opposite else '')}")
+            print(f"  OPPOSITE_TIME_DECODE: {repr(opposite)}")
+            print(f"  OPPOSITE_CER: {cer_opposite:.4f}")
+
+    except Exception as e:
+        print(f"[rtl-diag][{name}] failed: {e}")
+        
+class DirectionDecodeProbe(tf.keras.callbacks.Callback):
+    """
+    Periodically decodes the same fixed batch in normal output order and opposite
+    time order. For the fixed RTL model, NORMAL should become better than OPPOSITE
+    as training starts learning.
+    """
+
+    def __init__(
+        self,
+        data_provider,
+        vocab,
+        blank_index,
+        text_dir,
+        reverse_time_axis,
+        name="train",
+        every_n_epochs=5,
+        max_samples=3,
+    ):
+        super().__init__()
+        self.data_provider = data_provider
+        self.vocab = vocab
+        self.blank_index = blank_index
+        self.text_dir = text_dir
+        self.reverse_time_axis = reverse_time_axis
+        self.name = name
+        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.max_samples = max_samples
+
+        x_batch, y_batch = self.data_provider[0]
+        self.x_batch = np.asarray(x_batch)
+        self.y_batch = np.asarray(y_batch)
+
+    def on_epoch_end(self, epoch, logs=None):
+        epoch_num = epoch + 1
+
+        if epoch_num != 1 and epoch_num % self.every_n_epochs != 0:
+            return
+
+        y_pred = self.model.predict(self.x_batch, verbose=0)
+
+        pred_normal = decode_batch_greedy_np(y_pred, self.vocab, self.blank_index)
+        pred_opposite = decode_batch_greedy_np(y_pred[:, ::-1, :], self.vocab, self.blank_index)
+
+        normal_cers = []
+        opposite_cers = []
+
+        print(
+            f"[direction-probe][{self.name}] epoch={epoch_num} "
+            f"text_dir={self.text_dir} reverse_time_axis={self.reverse_time_axis}"
+        )
+
+        for i in range(min(self.max_samples, self.x_batch.shape[0])):
+            ref = label_row_to_text(self.y_batch[i], self.vocab, self.blank_index)
+            normal = pred_normal[i]
+            opposite = pred_opposite[i]
+
+            cer_n = simple_cer(ref, normal)
+            cer_o = simple_cer(ref, opposite)
+
+            normal_cers.append(cer_n)
+            opposite_cers.append(cer_o)
+
+            print(f"[direction-probe][{self.name}][sample {i}]")
+            print(f"  REF: {repr(ref)}")
+            print(f"  NORMAL: {repr(normal)} CER={cer_n:.4f}")
+            print(f"  OPPOSITE: {repr(opposite)} CER={cer_o:.4f}")
+
+        print(
+            f"[direction-probe][{self.name}] "
+            f"mean_normal_cer={float(np.mean(normal_cers)):.4f} "
+            f"mean_opposite_cer={float(np.mean(opposite_cers)):.4f}"
+        )
 
 
 # --------------------------------------------------
@@ -518,6 +883,7 @@ def main():
         raise ValueError(f"Invalid CGL_TEXT_DIR={text_dir}. Expected 'ltr' or 'rtl'.")
     
     early_patience = env("CGL_EARLY_STOP_PATIENCE", 10, int)
+    reduce_lr_patience = env("CGL_REDUCE_LR_PATIENCE", 10, int)
 
     resume_mode  = env("CGL_RESUME_MODE", "none", str)
     resume_which = env("CGL_RESUME_WHICH", "best", str)
@@ -533,7 +899,18 @@ def main():
     spot_ckpt = Path("/opt/ml/checkpoints/ckpt.weights.h5")
     instance_type = os.getenv("CGL_INSTANCE_TYPE", "unknown")
     
-    label_order_policy = "rtl_boundary_neutrals" if text_dir == "rtl" else "logical"
+    label_order_policy = "logical"
+
+    # Default: auto-enable for RTL, off for LTR.
+    # You can override with CGL_REVERSE_TIME_AXIS=true/false.
+    reverse_time_axis = env_bool(
+        "CGL_REVERSE_TIME_AXIS",
+        default=(text_dir == "rtl"),
+    )
+
+    sequence_axis_policy = (
+        "rtl_reverse_time_axis" if reverse_time_axis else "ltr_native_time_axis"
+    )
     
     
 
@@ -563,6 +940,8 @@ def main():
         "augment_enabled": bool((augment_json or "").strip()),
         "text_dir": text_dir,
         "label_order_policy": label_order_policy,
+        "reverse_time_axis": reverse_time_axis,
+        "sequence_axis_policy": sequence_axis_policy,
             })
         
     
@@ -614,7 +993,10 @@ def main():
         "activation": activation,
         "text_dir": text_dir,
         "label_order_policy": label_order_policy,
+        "reverse_time_axis": reverse_time_axis,
+        "sequence_axis_policy": sequence_axis_policy,
         "early_patience": early_patience,
+        "reduce_lr_patience": reduce_lr_patience,
         "resume_mode": resume_mode,
         "resume_which": resume_which,
         "resume_path": resume_path,
@@ -637,6 +1019,12 @@ def main():
         "lr": lr,
         "dropout": dropout,
         "activation": activation,
+        "text_dir": text_dir,
+        "early_patience": early_patience,
+        "reduce_lr_patience": reduce_lr_patience,
+        "label_order_policy": label_order_policy,
+        "reverse_time_axis": reverse_time_axis,
+        "sequence_axis_policy": sequence_axis_policy,
     }   
     
 
@@ -650,7 +1038,12 @@ def main():
     # --------------------------------------------------
 
     train_ref = resolve_split(dataset_uri, "train", cache_root)
-    val_ref   = resolve_split(dataset_uri, "val", cache_root)
+    val_ref = None
+    try:
+        val_ref = resolve_split(dataset_uri, "val", cache_root)
+    except Exception as e:
+        print(f"[dataset] validation split not found; training without validation. reason={e}")
+
 
     test_ref = None
     
@@ -666,12 +1059,15 @@ def main():
                 "annotations": str(train_ref.local_annotations_path),
                 "images_dir": str(train_ref.local_images_dir),
             },
-            "val": {
-                "annotations": str(val_ref.local_annotations_path),
-                "images_dir": str(val_ref.local_images_dir),
-            },
+        
         },
     }
+    
+    if val_ref:
+        dataset_manifest["splits"]["val"] = {
+            "annotations": str(val_ref.local_annotations_path),
+            "images_dir": str(val_ref.local_images_dir),
+        }
 
     if test_ref:
         dataset_manifest["splits"]["test"] = {
@@ -684,12 +1080,16 @@ def main():
 
     # OCR expects JSONL annotations
     train_items, train_max = load_jsonl(train_ref.local_annotations_path, text_dir or "ltr")
-    val_items,   val_max   = load_jsonl(val_ref.local_annotations_path, text_dir or "ltr" )
-   
-    
     train_items = absolutize_items(train_items, train_ref.local_root)
-    val_items   = absolutize_items(val_items,   val_ref.local_root)
     
+    
+    val_items = []
+    val_max = 0
+
+    if val_ref:
+        val_items, val_max = load_jsonl(val_ref.local_annotations_path, text_dir or "ltr")
+        val_items = absolutize_items(val_items, val_ref.local_root)
+        
     test_items = []
     test_max = 0
     if test_ref:
@@ -698,12 +1098,18 @@ def main():
     else:
         test_items = []
 
-    vocab = build_vocab(train_items + val_items)
+    all_label_items = train_items + val_items + test_items
+    vocab = build_vocab(all_label_items)
+    
     blank_index = len(vocab)
-    if(test_max):
-        max_len = max(train_max, val_max, test_max)
-    else:
-        max_len = max(train_max, val_max)
+
+    max_len = max(
+        [x for x in [train_max, val_max, test_max] if x and x > 0],
+        default=0,
+    )
+
+    if max_len <= 0:
+        raise RuntimeError("No valid OCR labels found in train/val/test splits")
     
     print(f"[dataset] train samples: {len(train_items)}")
     print(f"[dataset] val samples: {len(val_items)}")
@@ -737,6 +1143,9 @@ def main():
 
     preprocess_ops = describe_ops(preprocess_json)
     augment_ops = describe_ops(augment_json)
+    
+    image_padding_color = get_image_padding_color_from_preprocess_ops(preprocess_ops)
+    print(f"[preprocess] ImageResizer padding_color={image_padding_color}")
 
     print(f"[preprocess] deterministic ops requested: {json.dumps(preprocess_ops, ensure_ascii=False)}")
     print(f"[augment] stochastic ops requested: {json.dumps(augment_ops, ensure_ascii=False)}")
@@ -760,14 +1169,15 @@ def main():
         preprocess_cache_stats.append(train_cache_stats)
         preprocess_sample_inspection.append(inspect_sample_image_shape(train_items, "train"))
 
-        val_items, val_cache_stats = cache_deterministic_preprocessed_items(
-            val_items,
-            shared_preprocessors,
-            cache_base / "val",
-            split_name="val"
-        )
-        preprocess_cache_stats.append(val_cache_stats)
-        preprocess_sample_inspection.append(inspect_sample_image_shape(val_items, "val"))
+        if val_items:
+            val_items, val_cache_stats = cache_deterministic_preprocessed_items(
+                val_items,
+                shared_preprocessors,
+                cache_base / "val",
+                split_name="val"
+            )
+            preprocess_cache_stats.append(val_cache_stats)
+            preprocess_sample_inspection.append(inspect_sample_image_shape(val_items, "val"))            
 
         if test_items:
             test_items, test_cache_stats = cache_deterministic_preprocessed_items(
@@ -803,7 +1213,7 @@ def main():
         batch_size=effective_global_batch_size,
         data_preprocessors=provider_preprocessors,
         transformers=[
-            ImageResizer(width, height, keep_aspect_ratio=True),
+            ImageResizer(width, height, keep_aspect_ratio=True, padding_color=image_padding_color,),
             LabelIndexer(vocab),
             LabelPadding(max_word_length=max_len, padding_value=blank_index),
         ],
@@ -811,17 +1221,20 @@ def main():
     
     train_dp.augmentors = train_augmentors
 
-    val_dp = DataProvider(
-        dataset=val_items,
-        skip_validation=True,
-        batch_size=effective_global_batch_size,
-        data_preprocessors=provider_preprocessors,
-        transformers=[
-            ImageResizer(width, height, keep_aspect_ratio=True),
-            LabelIndexer(vocab),
-            LabelPadding(max_word_length=max_len, padding_value=blank_index),
-        ],
-    )
+    val_dp = None
+
+    if val_items:
+        val_dp = DataProvider(
+            dataset=val_items,
+            skip_validation=True,
+            batch_size=effective_global_batch_size,
+            data_preprocessors=provider_preprocessors,
+            transformers=[
+                ImageResizer(width, height, keep_aspect_ratio=True, padding_color=image_padding_color),
+                LabelIndexer(vocab),
+                LabelPadding(max_word_length=max_len, padding_value=blank_index),
+            ],
+        )
 
     test_dp = None
     if test_items:
@@ -831,7 +1244,7 @@ def main():
             batch_size=effective_global_batch_size,
             data_preprocessors=provider_preprocessors,
             transformers=[
-                ImageResizer(width, height, keep_aspect_ratio=True),
+                ImageResizer(width, height, keep_aspect_ratio=True, padding_color=image_padding_color,),
                 LabelIndexer(vocab),
                 LabelPadding(max_word_length=max_len, padding_value=len(vocab)),
             ],
@@ -845,11 +1258,38 @@ def main():
 
     with strategy.scope():
         model = train_model(
-                input_dim=(height, width, 3),
-                output_dim=len(vocab),
-                dropout=dropout,
-                activation=activation,
+            input_dim=(height, width, 3),
+            output_dim=len(vocab),
+            dropout=dropout,
+            activation=activation,
+            reverse_time_axis=reverse_time_axis,
+        )
+        
+        inspect_model_direction(
+            model=model,
+            text_dir=text_dir,
+            reverse_time_axis=reverse_time_axis,
+        )
+        
+        if text_dir == "rtl" and not reverse_time_axis:
+            print(
+                "[direction-check][WARNING] text_dir=rtl but reverse_time_axis=False. "
+                "This is probably wrong for CRNN/CTC Arabic logical labels."
             )
+
+        if text_dir == "rtl":
+            has_rtl_layer = any(layer.name == "rtl_reverse_time_axis" for layer in model.layers)
+            if reverse_time_axis and not has_rtl_layer:
+                raise RuntimeError(
+                    "RTL direction policy error: reverse_time_axis=True but "
+                    "model does not contain rtl_reverse_time_axis layer."
+                )
+
+        print(f"[direction] text_dir={text_dir}")
+        print(f"[direction] label_order_policy={label_order_policy}")
+        print(f"[direction] reverse_time_axis={reverse_time_axis}")
+        print(f"[direction] sequence_axis_policy={sequence_axis_policy}")
+        
         loaded_from_spot = False
         effective_lr = lr
         checkpoint_dir = Path("/opt/ml/checkpoints")
@@ -878,7 +1318,7 @@ def main():
 
                 print(f"[weights] loading weights from {resume_uri}")
                 local_weights = resolve_resume_weights(resume_uri, refs)
-                model.load_weights(local_weights)
+                model.load_weights(local_weights)  
                 print("[weights] initialized from checkpoint")            
             
             else:
@@ -908,36 +1348,68 @@ def main():
         # CTC training is numerically sensitive, especially after restoring weights.  
         
                         
-          
+        
         optimizer=tf.keras.optimizers.Adam(learning_rate=effective_lr)
 
         model.compile(
             optimizer=optimizer,
             loss=CTCloss(),
             metrics=[
-                CERMetric(vocabulary=vocab),
-                WERMetric(vocabulary=vocab),
+                SafeCERMetric(vocabulary=vocab),
+                SafeWERMetric(vocabulary=vocab),
             ],
         )
         # else:
         #     print("[opt] using optimizer state restored from spot checkpoint")
         
-       
+    
 
         
     # ---------------- callbacks ----------------
     
     
+    train_steps = len(train_items) // effective_global_batch_size
+    val_steps = len(val_items) // effective_global_batch_size if val_items else 0
+
+    if train_steps < 1:
+        raise RuntimeError(
+            f"Not enough training samples for one full global batch: "
+            f"train={len(train_items)}, global_batch={effective_global_batch_size}"
+        )
+
+    validation_enabled = val_dp is not None and val_steps >= 1
+
+    if not validation_enabled:
+        print(
+            f"[fit] validation disabled: val={len(val_items)}, "
+            f"global_batch={effective_global_batch_size}"
+        )
+        validation_steps = None
+    else:
+        validation_steps = val_steps
+
+
+
+    print(
+        f"[fit] train_steps={train_steps}, val_steps={val_steps}, "
+        f"train_remainder={len(train_items) % effective_global_batch_size}, "
+        f"val_remainder={len(val_items) % effective_global_batch_size}"
+    )
+    
+    monitor_metric = "val_CER" if validation_enabled else "CER"
+    monitor_mode = "min"
+    
+    print(f"[monitor] monitor_metric={monitor_metric}, validation_enabled={validation_enabled}")
     ckpt_dir = refs.models_dir
     
     
     callbacks = [
-        CGLKerasLogger(monitor="val_CER", mode="min"),
+        CGLKerasLogger(monitor=monitor_metric, mode=monitor_mode),
         # 🔹 Full model – best
         ModelCheckpoint(
             ckpt_dir / "best.keras",
-            monitor="val_CER",
-            mode="min",
+            monitor=monitor_metric,
+            mode=monitor_mode,
             save_best_only=True,
             verbose=0,
         ),
@@ -954,8 +1426,8 @@ def main():
             ckpt_dir / "best.weights.h5",
             save_weights_only=True,
             save_best_only=True,
-            monitor="val_CER",
-            mode="min",
+            monitor=monitor_metric,
+            mode=monitor_mode,
             verbose=0,
         ),
 
@@ -977,8 +1449,8 @@ def main():
 
         # 🔹 Early stopping (env-driven)
         CGLEarlyStopping(
-            monitor="val_CER",
-            mode="min",
+            monitor=monitor_metric,
+            mode=monitor_mode,
             patience=early_patience,
             restore_best_weights=True,
             verbose=0,
@@ -986,16 +1458,17 @@ def main():
 
         # 🔹 LR schedule
         ReduceLROnPlateau(
-            monitor="val_CER",
-            factor=0.9,
-            patience=10,
-            min_delta=1e-10,           
-            cooldown=2,
-            mode="min",
+            monitor=monitor_metric,
+            factor=0.8,
+            patience=reduce_lr_patience,
+            min_delta=1e-4,
+            cooldown=10,
+            mode=monitor_mode,
+            min_lr=1e-5,
             verbose=1,
         ),
         # ---- Upload policies via outputs.py ----
-        UploadBestOnImprove(outputs, monitor="val_CER", mode="min"),
+        UploadBestOnImprove(outputs, monitor=monitor_metric, mode=monitor_mode),
         UploadLastEveryEpoch(outputs),
 
     ]
@@ -1019,14 +1492,45 @@ def main():
                 "val": len(val_items),
                 "test": len(test_items),
             },
-            rtl_policy="auto",
+            rtl_policy={
+                "text_dir": text_dir,
+                "label_order_policy": label_order_policy,
+                "reverse_time_axis": reverse_time_axis,
+                "sequence_axis_policy": sequence_axis_policy,
+            },
             blank_index=blank_index,
             vocab=vocab,
             resume={},
         )
     )
     
-    
+    callbacks.append(
+        DirectionDecodeProbe(
+            data_provider=train_dp,
+            vocab=vocab,
+            blank_index=blank_index,
+            text_dir=text_dir,
+            reverse_time_axis=reverse_time_axis,
+            name="train_fixed_batch",
+            every_n_epochs=int(os.getenv("CGL_DIRECTION_PROBE_EVERY", "5")),
+            max_samples=int(os.getenv("CGL_DIRECTION_PROBE_SAMPLES", "3")),
+        )
+    )
+
+    if val_dp is not None:
+        callbacks.append(
+            DirectionDecodeProbe(
+                data_provider=val_dp,
+                vocab=vocab,
+                blank_index=blank_index,
+                text_dir=text_dir,
+                reverse_time_axis=reverse_time_axis,
+                name="val_fixed_batch",
+                every_n_epochs=int(os.getenv("CGL_DIRECTION_PROBE_EVERY", "5")),
+                max_samples=int(os.getenv("CGL_DIRECTION_PROBE_SAMPLES", "3")),
+            )
+        )
+            
 
     initial_epoch = 0
 
@@ -1039,77 +1543,217 @@ def main():
             print(f"[resume] Failed to read last_state.json: {e}")
 
     # ---------------- training ----------------
+
+    # Keep one DataProvider path, but make it repeatable for Keras 3 + MirroredStrategy.
+    train_fit_data = make_repeating_tf_dataset(train_dp, train_steps, "train")
+
+    if validation_steps is not None:
+        val_fit_data = make_repeating_tf_dataset(val_dp, validation_steps, "val")
+    else:
+        val_fit_data = None
+
     model.fit(
-        train_dp,
-        validation_data=val_dp,
+        train_fit_data,
+        validation_data=val_fit_data,
+        steps_per_epoch=train_steps,
+        validation_steps=validation_steps,
         epochs=epochs,
         initial_epoch=initial_epoch,
         callbacks=callbacks,
         verbose=0,
-        # workers=4,
-        # use_multiprocessing=True,
-        # max_queue_size=16,
     )
     
-    val_diag_report = None
+    print("[rtl-diag] running pre-training direction diagnostic...")
+
+    run_rtl_direction_batch_diagnostic(
+        model=model,
+        data_provider=train_dp,
+        vocab=vocab,
+        blank_index=blank_index,
+        text_dir=text_dir,
+        reverse_time_axis=reverse_time_axis,
+        name="train_prefit",
+        max_samples=3,
+    )
+
+    if val_dp is not None:
+        run_rtl_direction_batch_diagnostic(
+            model=model,
+            data_provider=val_dp,
+            vocab=vocab,
+            blank_index=blank_index,
+            text_dir=text_dir,
+            reverse_time_axis=reverse_time_axis,
+            name="val_prefit",
+            max_samples=3,
+        )
+        
+    try:
+        print("\n[eval-check] Running explicit Keras evaluate on train and val datasets...")
+
+        train_eval = model.evaluate(train_fit_data, steps=train_steps, verbose=0)
+        val_eval = (
+            model.evaluate(val_fit_data, steps=validation_steps, verbose=0)
+            if val_fit_data is not None
+            else None
+        )
+
+        print("[eval-check] metrics_names:", model.metrics_names)
+        print("[eval-check] raw train_eval:", train_eval)
+        print("[eval-check] raw val_eval:", val_eval)
+
+        try:
+            train_eval_dict = model.evaluate(
+                train_fit_data,
+                steps=train_steps,
+                verbose=0,
+                return_dict=True,
+            )
+
+            val_eval_dict = (
+                model.evaluate(
+                    val_fit_data,
+                    steps=validation_steps,
+                    verbose=0,
+                    return_dict=True,
+                )
+                if val_fit_data is not None
+                else {}
+            )
+
+            train_eval_dict = {
+                k: float(v) if hasattr(v, "__float__") else v
+                for k, v in train_eval_dict.items()
+            }
+
+            val_eval_dict = {
+                k: float(v) if hasattr(v, "__float__") else v
+                for k, v in val_eval_dict.items()
+            }
+
+            print("[eval-check] return_dict train:", json.dumps(train_eval_dict, indent=2))
+            print("[eval-check] return_dict val:", json.dumps(val_eval_dict, indent=2))
+
+        except Exception as e:
+            print(f"[eval-check] return_dict evaluate failed: {e}")
+
+    except Exception as e:
+        print(f"[eval-check] model.evaluate failed: {e}")
+            
+    train_diag_report = None
 
     try:
-        print("[diag] running validation diagnostics...")
-        # ---------------- diagnostics provider ----------------
-        # Use the same validation path, but with a smaller GLOBAL batch size to avoid OOM
-        diag_global_batch_size = min(16, client_batch_size)
+        print("[diag] running training diagnostics on fixed subset...")
 
-        val_diag_dp = DataProvider(
-            dataset=val_items,
-            batch_size=diag_global_batch_size,
+        # Keep this small to avoid long runtime
+        train_diag_sample_count = min(100, len(train_items))
+        train_diag_items = train_items[:train_diag_sample_count]
+
+        train_diag_dp = DataProvider(
+            dataset=train_diag_items,
+            skip_validation=True,
+            batch_size=min(16, client_batch_size),
             data_preprocessors=provider_preprocessors,
             transformers=[
-                ImageResizer(width, height, keep_aspect_ratio=True),
+                ImageResizer(
+                    width,
+                    height,
+                    keep_aspect_ratio=True,
+                    padding_color=image_padding_color,
+                ),
                 LabelIndexer(vocab),
                 LabelPadding(max_word_length=max_len, padding_value=blank_index),
             ],
         )
-        val_diag_report = run_val_diagnostics(
+
+        train_diag_report = run_val_diagnostics(
             model=model,
-            data_provider=val_diag_dp,
-            dataset_items=val_items,
+            data_provider=train_diag_dp,
+            dataset_items=train_diag_items,
             vocab=vocab,
             blank_index=blank_index,
         )
 
-        print(f"[diag] val mean CER={val_diag_report['mean_cer']:.4f}")
-        print(f"[diag] top error chars={val_diag_report['top_error_chars'][:20]}")
-        print(f"[diag] CER by label length bucket={val_diag_report['cer_by_label_length_bucket']}")
-        print(f"[diag] CER by orig width bucket={val_diag_report['cer_by_orig_width_bucket']}")
-        print(f"[diag] CER by orig height bucket={val_diag_report['cer_by_orig_height_bucket']}")
-        print(f"[diag] CER by orig aspect bucket={val_diag_report['cer_by_orig_aspect_bucket']}")
+        print(f"[diag] train subset mean CER={train_diag_report['mean_cer']:.4f}")
+        print(f"[diag] train subset mean WER={train_diag_report.get('mean_wer'):.4f}")
+        print(f"[diag] train subset sample_count={train_diag_report.get('sample_count')}")        
+        
 
     except Exception as e:
-        print(f"[diag] validation diagnostics failed: {e}")
-        val_diag_report = {
-            "error": str(e)
-        }
+        print(f"[diag] training diagnostics failed: {e}")
+        train_diag_report = {"error": str(e)}
         
+    val_diag_report = None
+
+    if val_items:
+        try:
+            print("[diag] running validation diagnostics...")
+
+            diag_global_batch_size = min(16, client_batch_size)
+
+            val_diag_dp = DataProvider(
+                dataset=val_items,
+                skip_validation=True,
+                batch_size=diag_global_batch_size,
+                data_preprocessors=provider_preprocessors,
+                transformers=[
+                    ImageResizer(width, height, keep_aspect_ratio=True, padding_color=image_padding_color),
+                    LabelIndexer(vocab),
+                    LabelPadding(max_word_length=max_len, padding_value=blank_index),
+                ],
+            )
+
+            val_diag_report = run_val_diagnostics(
+                model=model,
+                data_provider=val_diag_dp,
+                dataset_items=val_items,
+                vocab=vocab,
+                blank_index=blank_index,
+            )
+
+            print(f"[diag] val mean CER={val_diag_report['mean_cer']:.4f}")
+            print(f"[diag] val mean WER={val_diag_report.get('mean_wer'):.4f}")
+            print(f"[diag] top error chars={val_diag_report['top_error_chars'][:20]}")
+
+        except Exception as e:
+            print(f"[diag] validation diagnostics failed: {e}")
+            val_diag_report = {"error": str(e)}
+    else:
+        print("[diag] validation diagnostics skipped: no validation split")
+        val_diag_report = {
+            "skipped": True,
+            "reason": "no_validation_split"
+        }
+            
     # ---------------- test evaluation ----------------
     test_metrics = None
-    if test_dp:
+    test_steps = len(test_items) // effective_global_batch_size
+
+    if test_dp and test_steps >= 1:
         emit(CGL_EVAL, {
             "phase": "begin",
             "split": "test",
             "samples": len(test_items),
+            "steps": test_steps,
         })
 
-        results = model.evaluate(test_dp, verbose=0)
+        test_fit_data = make_repeating_tf_dataset(test_dp, test_steps, "test")
+        results = model.evaluate(test_fit_data, steps=test_steps, verbose=0)
 
-        # Keras returns list aligned with model.metrics_names
         test_metrics = dict(zip(model.metrics_names, map(float, results)))
 
         emit(CGL_EVAL, {
             "phase": "end",
             "split": "test",
             "samples": len(test_items),
+            "steps": test_steps,
             "metrics": test_metrics,
         })
+    elif test_dp:
+        print(
+            f"[test] test evaluation skipped: test={len(test_items)} is smaller than "
+            f"global_batch={effective_global_batch_size}"
+        )
 
 
     # ---------------- save artifacts ----------------
@@ -1119,9 +1763,12 @@ def main():
 
     model.save(final_model)
     model.save_weights(final_weights)
+    # Optional but useful for resume compatibility   
+    
 
     outputs.upload_model(final_model, "final.keras")
     outputs.upload_model(final_weights, "final.weights.h5")
+    
 
 
     with open(refs.artifacts_dir / "vocab.json", "w", encoding="utf-8") as f:
@@ -1163,6 +1810,12 @@ def main():
             "cached": use_preprocess_cache,
             "ops": preprocess_ops,
             "cache_stats": preprocess_cache_stats
+        },
+        "direction": {
+            "text_dir": text_dir,
+            "label_order_policy": label_order_policy,
+            "reverse_time_axis": reverse_time_axis,
+            "sequence_axis_policy": sequence_axis_policy,
         },
         }
     

@@ -68,6 +68,37 @@ def cer_simple(ref: str, hyp: str):
     edits = sum(1 for _, _, op in aligned if op != "eq")
     return edits / max(1, len(ref))
 
+def wer_simple(ref: str, hyp: str):
+    """
+    Simple word error rate:
+    Levenshtein distance over whitespace-split words / number of reference words.
+    """
+    ref_words = ref.strip().split()
+    hyp_words = hyp.strip().split()
+
+    if len(ref_words) == 0:
+        return 0.0 if len(hyp_words) == 0 else 1.0
+
+    n, m = len(ref_words), len(hyp_words)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(n + 1):
+        dp[i][0] = i
+
+    for j in range(m + 1):
+        dp[0][j] = j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if ref_words[i - 1] == hyp_words[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,        # deletion
+                dp[i][j - 1] + 1,        # insertion
+                dp[i - 1][j - 1] + cost, # substitution / equal
+            )
+
+    return dp[n][m] / max(1, len(ref_words))
+
 
 def greedy_decode_logits(logits, vocab, blank_index):
     probs_all = tf.nn.softmax(logits, axis=-1).numpy()
@@ -191,12 +222,17 @@ def run_val_diagnostics(
         for item, ref, pred in zip(batch_items, refs, preds):
             geom = _get_geom_from_provider_item(item)
 
+            row_cer = cer_simple(ref, pred)
+            row_wer = wer_simple(ref, pred)
+
             rows.append({
                 "img": item[0] if isinstance(item, (list, tuple)) and len(item) > 0 else None,
                 "ref": ref,
                 "pred": pred,
-                "cer": cer_simple(ref, pred),
+                "cer": row_cer,
+                "wer": row_wer,
                 "label_length": len(ref),
+                "word_count": len(ref.strip().split()),
                 "space_count": ref.count(" "),
                 "orig_width": geom["orig_width"],
                 "orig_height": geom["orig_height"],
@@ -211,15 +247,19 @@ def run_val_diagnostics(
         return {
             "error": "Diagnostics produced no rows; all batches likely failed or were skipped",
             "mean_cer": None,
+            "mean_wer": None,
             "top_error_chars": [],
             "cer_by_label_length_bucket": {},
             "cer_by_orig_width_bucket": {},
             "cer_by_orig_height_bucket": {},
             "cer_by_orig_aspect_bucket": {},
+            "wer_by_label_length_bucket": {},
+            "wer_by_orig_width_bucket": {},
+            "wer_by_orig_height_bucket": {},
+            "wer_by_orig_aspect_bucket": {},
             "sample_count": 0,
             "failed_or_skipped_samples": len(dataset_items),
         }
-
     error_char_counter = Counter()
     ref_char_counter = Counter()
 
@@ -227,6 +267,11 @@ def run_val_diagnostics(
     cer_by_width_bucket = defaultdict(list)
     cer_by_height_bucket = defaultdict(list)
     cer_by_aspect_bucket = defaultdict(list)
+    
+    wer_by_length_bucket = defaultdict(list)
+    wer_by_width_bucket = defaultdict(list)
+    wer_by_height_bucket = defaultdict(list)
+    wer_by_aspect_bucket = defaultdict(list)
 
     for row in rows:
         ref = row["ref"]
@@ -245,9 +290,17 @@ def run_val_diagnostics(
         cer_by_height_bucket[row["orig_height_bucket"]].append(row["cer"])
         cer_by_aspect_bucket[row["orig_aspect_bucket"]].append(row["cer"])
 
+        wer_by_length_bucket[row["label_length_bucket"]].append(row["wer"])
+        wer_by_width_bucket[row["orig_width_bucket"]].append(row["wer"])
+        wer_by_height_bucket[row["orig_height_bucket"]].append(row["wer"])
+        wer_by_aspect_bucket[row["orig_aspect_bucket"]].append(row["wer"])
+
     return {
         "mean_cer": float(np.mean([r["cer"] for r in rows])),
+        "mean_wer": float(np.mean([r["wer"] for r in rows])),
+
         "top_error_chars": error_char_counter.most_common(100),
+
         "char_error_profile": [
             {
                 "char": ch,
@@ -261,6 +314,7 @@ def run_val_diagnostics(
                 reverse=True
             )[:200]
         ],
+
         "cer_by_label_length_bucket": {
             k: float(np.mean(v)) for k, v in cer_by_length_bucket.items()
         },
@@ -273,6 +327,20 @@ def run_val_diagnostics(
         "cer_by_orig_aspect_bucket": {
             k: float(np.mean(v)) for k, v in cer_by_aspect_bucket.items()
         },
+
+        "wer_by_label_length_bucket": {
+            k: float(np.mean(v)) for k, v in wer_by_length_bucket.items()
+        },
+        "wer_by_orig_width_bucket": {
+            k: float(np.mean(v)) for k, v in wer_by_width_bucket.items()
+        },
+        "wer_by_orig_height_bucket": {
+            k: float(np.mean(v)) for k, v in wer_by_height_bucket.items()
+        },
+        "wer_by_orig_aspect_bucket": {
+            k: float(np.mean(v)) for k, v in wer_by_aspect_bucket.items()
+        },
+
         "sample_count": len(rows),
         "failed_or_skipped_samples": max(0, len(dataset_items) - len(rows)),
     }

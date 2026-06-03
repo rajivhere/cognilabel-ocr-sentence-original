@@ -2,12 +2,18 @@
 ARG PY_BASE=python:3.12.7-slim
 FROM ${PY_BASE}
 
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 \
-    TF_CPP_MIN_LOG_LEVEL=1 PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TF_CPP_MIN_LOG_LEVEL=1 \
+    PYTHONPATH=/app \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=20 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_PROGRESS_BAR=off
 
 RUN rm -rf /var/lib/apt/lists/* \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
     libglib2.0-0 \
@@ -16,7 +22,7 @@ RUN rm -rf /var/lib/apt/lists/* \
     libxrender1 \
     ca-certificates \
     git \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -24,14 +30,21 @@ WORKDIR /app
 COPY requirements.train.txt requirements.s3.txt ./
 
 # Install TF (GPU; CUDA libs bundled with the wheel)
-RUN python -m pip install --upgrade pip && \
-    pip install "tensorflow[and-cuda]==2.18.0"
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# syntax=docker/dockerfile:1
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install \
+    --default-timeout=300 \
+    --retries=20 \
+    "tensorflow[and-cuda]==2.18.0"
 
 # Install the rest from requirements (keep TF from above)
 RUN grep -viE '^(tensorflow)(==|>=|=|$)' requirements.train.txt > req_nontf.txt && \
     pip install --upgrade-strategy only-if-needed -r req_nontf.txt && \
     if [ -s requirements.s3.txt ]; then \
-      pip install --upgrade-strategy only-if-needed -r requirements.s3.txt ; \
+    pip install --upgrade-strategy only-if-needed -r requirements.s3.txt ; \
     fi
 
 ARG GITHUB_TOKEN
@@ -50,9 +63,11 @@ COPY Ocr-sentence-train/model.py                 /app/Ocr-sentence-train/model.p
 # COPY Ocr-sentence-train/train_ocr_cglml_exec.py  /app/Ocr-sentence-train/train_ocr_cglml_exec.py
 COPY Ocr-sentence-train/train_multi_gpu.py  /app/Ocr-sentence-train/train_multi_gpu.py
 COPY Ocr-sentence-train/last_state_writer.py     /app/Ocr-sentence-train/last_state_writer.py
-COPY Ocr-sentence-train/uploadUtil.py            /app/Ocr-sentence-train/uploadUtil.py
+COPY Ocr-sentence-train/uploadUtil.py            /app/Ocr-sentence-train/uploadUtil.py  
 COPY Ocr-sentence-train/preprocessors.py           /app/Ocr-sentence-train/preprocessors.py
 COPY Ocr-sentence-train/val_diagnostics.py           /app/Ocr-sentence-train/val_diagnostics.py
+COPY Ocr-sentence-train/loss.py           /app/Ocr-sentence-train/loss.py
+COPY Ocr-sentence-train/metrics.py           /app/Ocr-sentence-train/metrics.py
 
 
 WORKDIR /app/Ocr-sentence-train
